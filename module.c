@@ -13,6 +13,7 @@
 
 #include <linux/fs.h>
 #include <linux/pci.h>
+#include <linux/blkdev.h>
 #include <linux/slab.h>
 #include <asm/uaccess.h>
 
@@ -21,18 +22,18 @@
 MODULE_AUTHOR("Henry");
 MODULE_DESCRIPTION("Nothing");
 
+static void * inport;
 static int dev_major = 0;
+#ifdef THREAD_SAFE_
 static volatile int isOpen = 0;
-static char * name = "modTest";
-//static char msgBuff[80];
-static char * msg = "Hello world!!";
-module_param(name, charp, 0);
+#else
+static int isOpen = 0;
+#endif
+static const char * name = "InPos_Module";
+static const char * msg = "Hello world!!";
 
-//module_param(irq, int, 0);
-//MODULE_PARM_DESC(irq,"aaaa");
+/*----------CHAR DRIVER----------*/
 
-
-/* DMA BUFFER FILE OPERATIONS */
 static struct file_operations fops = {
     .unlocked_ioctl = NULL, /* ioctl */
     .mmap = dev_mmap,
@@ -43,18 +44,38 @@ static struct file_operations fops = {
             
 };
 
-int init_module() { 
-    dev_major = register_chrdev(0,name,&fops);
-    if (dev_major < 0) {
-            printk(KERN_ALERT "ERROR - Device register failed with code: %d\n", dev_major);
-            return dev_major;            
-    }
+/*----------PCI DRIVER----------*/
+
+static struct pci_device_id pci_ids[] = {
+    { PCI_DEVICE(PCI_VENDOR_ID_ALTERA, PCI_DEVICE_ID_CYCLONE_IV), },
+    {0, } 
+};
+MODULE_DEVICE_TABLE(pci, pci_ids);
+
+static struct pci_driver pcidev_driver = {
+   .name = name,
+   .id_table= pci_ids,
+   .probe = pci_probe,
+   .remove = pci_remove
+};
+
+/*----------INITIALIZATION & CLEANUP----------*/
+
+int __init init_module() { 
     
-    return 0;
-	
+    int r = pci_register_driver(pcidev_driver);
+    if (r < 0)
+        printk(KERN_ALERT "ERROR - PCI Device register failed with code: %d\n", r);
+    
+    dev_major = register_chrdev(0,name, &fops);
+    if (dev_major < 0)
+        printk(KERN_ALERT "ERROR - Device register failed with code: %d\n", dev_major);            
+    
+    return dev_major | r;
 }
-void cleanup_module () { 
+void  __exit cleanup_module () { 
     unregister_chrdev(dev_major, name);
+    pci_unregister_driver(pcidev_driver);
 }
 
 static int dev_open(struct inode *inode, struct file *fle) {
@@ -87,12 +108,34 @@ static ssize_t dev_read(struct file *fle, char __user * buffer, size_t length, l
     }
     return bytes_read;
 }
-static ssize_t dev_write (struct file *fle, const char __user *buffer, size_t length, loff_t *offset) {
-    printk(KERN_ALERT "Operation not supported!\n");
-    return -EINVAL;
-}
+
 static int dev_mmap (struct file *fle, struct vm_area_struct *vmarea) {
     /*NOT IMPLEMENTED*/
     return -EINVAL;
 }
 
+
+
+
+
+static int pci_probe (struct pci_dev *dev, const struct pci_device_id *id) {
+    unsigned long resource;
+    pci_enable_device(dev);
+    
+    if (dev->revision != 0x01) {
+        printk(KERN_ALERT "cannot find pci device!\n");
+        return -ENODEV;
+    }
+    resource = pci_resource_start(dev, 0);
+#ifdef VERBOSE_
+    int vendor;
+    pci_read_config_dword(dev, 0, &vendor);
+    printk(KERN_ALERT "%s - vendor id: %d\n", name, vendor);
+    printk(KERN_ALERT "%s - Resource base address 0 starts at: %lx\n", name, resource);
+#endif
+    inport = ioremap_nocache(resource + 0xC020, 0x20);
+}
+
+static void pci_remove (struct pci_dev *dev) {
+    
+}

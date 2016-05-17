@@ -10,12 +10,15 @@
 
 /*DEFNITIONS*/
 #define THREAD_SAFE_
+#define PCI_VENDOR_ID_ALTERA 0x1172
+#define PCI_DEVICE_ID_CYCLONE_IV 0x0004
 
 static int dev_open(struct inode *inode, struct file *fle);
 static int dev_release(struct inode *inode, struct file *fle);
 static ssize_t dev_read(struct file *fle, char __user * buffer, size_t length, loff_t *offset);
-static ssize_t dev_write (struct file *fle, const char __user *buffer, size_t length, loff_t *offset);
 static int dev_mmap (struct file *fle, struct vm_area_struct *vmarea);
+static int pci_probe (struct pci_dev *dev, const struct pci_device_id *id);
+static void pci_remove (struct pci_dev *dev);
 
 
 /*I don't know if I need the increment to be atomic, but just in case...*/
