@@ -9,21 +9,24 @@
 
 #include <linux/kernel.h>
 #include <linux/errno.h>
-
+#include <linux/slab.h>
 #include <linux/fs.h>
 #include <linux/pci.h>
-#include <linux/blkdev.h>
+#include<linux/kthread.h>
 #include <linux/slab.h>
+#include <linux/mm.h>
 #include <asm/uaccess.h>
 #include <asm/segment.h>
+//#include <asm-generic/errno-base.h>
+#include<linux/sched.h>
 
 #include "InPosMod.h"
-#define MIN_REG_SIZE sizeof(struct ImgStruct) * RING_BUFFER_LENGTH
+
 
 MODULE_AUTHOR("Henry");
 MODULE_DESCRIPTION("Indoor positioning system device driver");
 
-
+static const char * name = "InPos_Module";
 static int dev_major = 0;
 #ifdef THREAD_SAFE_
 static volatile int isOpen = 0;
@@ -31,11 +34,13 @@ static volatile int isOpen = 0;
 static int isOpen = 0;
 #endif
 static struct pci_dev *inPos_device = 0;
+static bool still_polling;
 static struct ImgStruct * pImage;
+static struct PhysImg *pHardImg;
+struct task_struct * poll_thread;
 static struct PCI_Region region = {
     .resource_num = -1
 };
-
 
 static struct file_operations fops = {
     .mmap = dev_mmap,
@@ -43,11 +48,11 @@ static struct file_operations fops = {
     .flush = dev_flush
 };
 
-
 /*----------INITIALIZATION & CLEANUP----------*/
 
-int __init init_module() {             
+int __init init_module(void) {             
     int cmd, i, flags;
+    struct resource * r;
     inPos_device = pci_get_device(PCI_VENDOR_ID_ALTERA, PCI_DEVICE_ID_CYCLONE_IV, inPos_device);
     if (!inPos_device) {
         printk(KERN_ALERT "ERROR - Device register failed, no such device\n");            
@@ -61,6 +66,11 @@ int __init init_module() {
     set_command_flag(&cmd, PCI_COMMAND_MASTER); /* Enable bus mastering */
     set_command_flag(&cmd, PCI_COMMAND_INVALIDATE); /* Use memory write and invalidate */
     
+    if (!dma_set_mask(&inPos_device->dev, 0xffffffff)) {
+         printk (KERN_ALERT "DMA 32-bit not supported\n");
+         return -ENOTSUPP;
+    }
+       
     /* Find desired region */
     
     for (i = 0; i < DEVICE_COUNT_RESOURCE; i++) {
@@ -70,18 +80,27 @@ int __init init_module() {
         flags = pci_resource_flags(inPos_device, i);
         if (!(flags & IORESOURCE_IO || region.size)) // is not IO and has size > 0
             continue;
-        if ((region.size >= MIN_REG_SIZE) && !(flags & IORESOURCE_READONLY)) {
+        if ((region.size >= sizeof(struct PhysImg)) && !(flags & IORESOURCE_READONLY)) {
             region.resource_num = i;
             break;
         }
     }
     if (region.resource_num < 0) {
-        printk(KERN_ALERT "ERROR - Device memory region with size >= %d not found!\n", MIN_REG_SIZE);
+        printk(KERN_ALERT "ERROR - Device memory region with size >= %d not found!\n", sizeof(struct PhysImg));
         return -EINVAL;
     }
-        
+     
     region.phys_addr &= PCI_BASE_ADDRESS_MEM_MASK;
     region.size = ~(region.size & PCI_BASE_ADDRESS_MEM_MASK) + 1;
+    
+    r = request_mem_region(region.phys_addr, region.size, name);
+    if (!r) {
+        printk(KERN_ALERT "Cannot allocate memory region for hardware mapping\n");
+        return -ENOMEM;
+    }
+    pHardImg = (struct PhysImg*) r->start;
+    pHardImg = ioremap_page_range((unsigned long)pHardImg, (unsigned long) pHardImg + sizeof(struct PhysImg), 
+            region.phys_addr, PAGE_KERNEL);
     
     dev_major = register_chrdev(IN_POS_MAJOR, name, &fops);
     if (dev_major < 0) {
@@ -92,7 +111,7 @@ int __init init_module() {
     return 0;
 }
 
-void  __exit cleanup_module() { 
+void  __exit cleanup_module(void) { 
     unregister_chrdev(dev_major, name);
     kfree(inPos_device);
 }
@@ -104,39 +123,60 @@ inline void set_command_flag(int *cmd, int flag) {
 
 static int dev_open(struct inode *inode, struct file *fle) {
     
+    if (!try_module_get(THIS_MODULE))
+        return -EAGAIN;
+    
     if (isOpen)
         return -EBUSY;
-    
     isOpen++;
-    try_module_get(THIS_MODULE);
-    pImage = (struct ImgStruct*) region.phys_addr;
+
+    pImage = kmalloc(sizeof(struct ImgStruct), GFP_DMA);
     return 0;
-    
 }
 static int dev_flush(struct file *fle, fl_owner_t id) {
     isOpen--;
-    
+    kthread_stop(poll_thread);
+    while(still_polling)
+        yield();
+    kfree(pImage);
     module_put(THIS_MODULE);
     return 0;
 }
 
-static int dev_mmap (struct file *fle, struct vm_area_struct *vmarea) {
-    unsigned long vma_size;
-    while(!pImage->canRead) {
-        yield();
+static int dev_poll(void* data) {
+    still_polling = 1;
+    while (!kthread_should_stop()) {
+        while(!(pHardImg->canRead) || kthread_should_stop()) {
+            yield();
+        }
+        if (kthread_should_stop()) {
+            still_polling = 0;
+            return 0;
+        }
+        if (!pImage->canWrite) 
+            continue;
+        
+        memcpy((void*)&(pHardImg->img), (void*)&(pImage->img), SIZE_OF_IMG);
+        pImage->canRead = 1;
+        pHardImg->canRead = 0;
     }
+    still_polling = 0;
+    return 0;
+}
+
+static int dev_mmap (struct file *fle, struct vm_area_struct *vmarea) {
+    unsigned int vma_size;
+
     vma_size = vmarea->vm_start - vmarea->vm_end;
     
-    if ((vma_size + vmarea->vm_pgoff * PAGE_SIZE) > SIZE_OF_IMG)
+    if ((vma_size + vmarea->vm_pgoff * PAGE_SIZE) > sizeof(struct ImgStruct))
         return -EINVAL;
     
-    if (!remap_pfn_range(vmarea, vmarea->vm_start, ((unsigned int) &(pImage->img)) << PAGE_SHIFT, 
-            SIZE_OF_IMG, vmarea->vm_page_prot))
-        return -EAGAIN;
-
-    pImage = (struct ImgStruct*) region.phys_addr + PLUS_1_MOD_RB((unsigned int)pImage);
+    if (!remap_pfn_range(vmarea, vmarea->vm_start, (unsigned int) pImage << PAGE_SHIFT, 
+            sizeof(struct ImgStruct), vmarea->vm_page_prot))
+        return -EAGAIN;   
     
-    pImage->canWrite = 1;
+    poll_thread = kthread_run(&dev_poll, (void*) 0, "polling_thread");
     
     return 0;
 }
