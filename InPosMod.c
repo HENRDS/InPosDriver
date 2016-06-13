@@ -4,21 +4,6 @@
  *
  * Created on 16 de Maio de 2016, 19:02
  */
-#include <linux/module.h>
-#include <linux/version.h>
-
-#include <linux/kernel.h>
-#include <linux/errno.h>
-#include <linux/slab.h>
-#include <linux/fs.h>
-#include <linux/pci.h>
-#include<linux/kthread.h>
-#include <linux/slab.h>
-#include <linux/mm.h>
-#include <asm/uaccess.h>
-#include <asm/segment.h>
-//#include <asm-generic/errno-base.h>
-#include<linux/sched.h>
 
 #include "InPosMod.h"
 
@@ -37,7 +22,6 @@ static struct pci_dev *inPos_device = 0;
 static bool still_polling;
 static struct ImgStruct * pImage;
 static struct PhysImg *pHardImg;
-struct task_struct * poll_thread;
 static struct PCI_Region region = {
     .resource_num = -1
 };
@@ -93,14 +77,6 @@ int __init init_module(void) {
     region.phys_addr &= PCI_BASE_ADDRESS_MEM_MASK;
     region.size = ~(region.size & PCI_BASE_ADDRESS_MEM_MASK) + 1;
     
-    r = request_mem_region(region.phys_addr, region.size, name);
-    if (!r) {
-        printk(KERN_ALERT "Cannot allocate memory region for hardware mapping\n");
-        return -ENOMEM;
-    }
-    pHardImg = (struct PhysImg*) r->start;
-    pHardImg = ioremap_page_range((unsigned long)pHardImg, (unsigned long) pHardImg + sizeof(struct PhysImg), 
-            region.phys_addr, PAGE_KERNEL);
     
     dev_major = register_chrdev(IN_POS_MAJOR, name, &fops);
     if (dev_major < 0) {
@@ -129,38 +105,13 @@ static int dev_open(struct inode *inode, struct file *fle) {
     if (isOpen)
         return -EBUSY;
     isOpen++;
-
-    pImage = kmalloc(sizeof(struct ImgStruct), GFP_DMA);
+    pImage = kmalloc(sizeof(struct ImgStruct) * RING_BUFFER_LENGTH, GFP_DMA);
     return 0;
 }
 static int dev_flush(struct file *fle, fl_owner_t id) {
     isOpen--;
-    kthread_stop(poll_thread);
-    while(still_polling)
-        yield();
     kfree(pImage);
     module_put(THIS_MODULE);
-    return 0;
-}
-
-static int dev_poll(void* data) {
-    still_polling = 1;
-    while (!kthread_should_stop()) {
-        while(!(pHardImg->canRead) || kthread_should_stop()) {
-            yield();
-        }
-        if (kthread_should_stop()) {
-            still_polling = 0;
-            return 0;
-        }
-        if (!pImage->canWrite) 
-            continue;
-        
-        memcpy((void*)&(pHardImg->img), (void*)&(pImage->img), SIZE_OF_IMG);
-        pImage->canRead = 1;
-        pHardImg->canRead = 0;
-    }
-    still_polling = 0;
     return 0;
 }
 
@@ -176,7 +127,6 @@ static int dev_mmap (struct file *fle, struct vm_area_struct *vmarea) {
             sizeof(struct ImgStruct), vmarea->vm_page_prot))
         return -EAGAIN;   
     
-    poll_thread = kthread_run(&dev_poll, (void*) 0, "polling_thread");
     
     return 0;
 }
